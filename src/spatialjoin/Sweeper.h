@@ -247,6 +247,7 @@ class Sweeper {
     for (size_t i = 0; i < _outBuffers.size(); i++) {
       if (_outBuffers[i]) delete[] _outBuffers[i];
     }
+    delete[] _outBuffer;
   }
 
   util::geo::I32Box add(const util::geo::I32MultiPolygon& a,
