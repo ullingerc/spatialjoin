@@ -393,6 +393,18 @@ int main(int, char**) {
     }
 
     {
+      // forceTwoSided must suppress relations between geometries that all
+      // came in as a single side (e.g. a real run with an empty second
+      // input file) instead of falling back to self-join semantics
+      RunStats stats;
+      sj::SweeperCfg forcedCfg = cfg;
+      forcedCfg.forceTwoSided = true;
+      auto res =
+          fullRun(TEST_DATASET_DIR "/brandenburg", forcedCfg, &stats);
+      TEST(res.empty());
+    }
+
+    {
       RunStats stats;
       auto res = fullRun(
           TEST_DATASET_DIR "/brandenburg_nonself", cfg, &stats);
