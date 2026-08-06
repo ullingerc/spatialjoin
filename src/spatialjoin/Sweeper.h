@@ -111,6 +111,35 @@ inline bool operator==(const BoxVal& a, const BoxVal& b) {
   return a.id == b.id && a.loY == b.loY && a.upY == b.upY && a.type == b.type;
 }
 
+// Geometry-derived data for an area (polygon) that does not depend on the
+// geometry's `gid`/`side`/`subid` (i.e. on the query it is added for): the
+// X-sorted polygon, its box ids and oriented bounding box, and the values
+// derived from them that `Sweeper::add()` would otherwise recompute on every
+// single call. Computed once via `precomputeArea()` and passed to
+// `Sweeper::addPrecomputed()`, which always uses the "general" (non-simple,
+// non-folded) area representation -- callers should only bother precomputing
+// geometries for which that tradeoff is worth it (i.e. not tiny polygons).
+struct PrecomputedArea {
+  util::geo::I32XSortedPolygon spoly;
+  boxids::BoxIdList boxIds;
+  util::geo::I32Polygon obb;
+  util::geo::I32Box rawBox45;
+  util::geo::I32Point rightPoint;
+  double areaSize = 0;
+  size_t polySize = 0;
+};
+
+// Same as `PrecomputedArea`, but for a line.
+struct PrecomputedLine {
+  util::geo::I32XSortedLine sline;
+  boxids::BoxIdList boxIds;
+  util::geo::I32Polygon obb;
+  util::geo::I32Box rawBox45;
+  util::geo::I32Point rightPoint;
+  double len = 0;
+  size_t lineSize = 0;
+};
+
 struct SweepVal {
   SweepVal(size_t id, GeomType type)
       : id(id), type(type), side(false), large(false) {}
@@ -216,6 +245,15 @@ struct SweeperCfg {
   std::function<void(size_t)> sweepProgressCb;
   std::function<void()> sweepCancellationCb;
 };
+
+// Compute a `PrecomputedArea`/`PrecomputedLine` for later reuse across many
+// `Sweeper::addPrecomputed()` calls (e.g. across queries). The `cfg` passed
+// here must agree on `useBoxIds`/`useOBB`/`useDiagBox`/`useFastSweepSkip`
+// with the `cfg` of every `Sweeper` the result is later passed to.
+PrecomputedArea precomputeArea(const util::geo::I32Polygon& poly,
+                               const SweeperCfg& cfg);
+PrecomputedLine precomputeLine(const util::geo::I32Line& line,
+                               const SweeperCfg& cfg);
 
 // buffer size _must_ be multiples of sizeof(BoxVal) and should hold at least
 // one element
@@ -325,6 +363,24 @@ class Sweeper {
            bool side, WriteBatch& batch) const;
 
   void addBatch(WriteBatch& cands);
+
+  // Like `add()`, but taking a `PrecomputedArea`/`PrecomputedLine` obtained
+  // from `precomputeArea()`/`precomputeLine()` instead of a raw geometry,
+  // skipping the box-id/OBB computation and X-sorting `add()` would
+  // otherwise redo on every call. Always uses the "general" area/line
+  // representation (see `PrecomputedArea`/`PrecomputedLine`).
+  util::geo::I32Box addPrecomputed(const PrecomputedArea& precomputed,
+                                   const std::string& gid, bool side,
+                                   WriteBatch& batch) const;
+  util::geo::I32Box addPrecomputed(const PrecomputedArea& precomputed,
+                                   const std::string& gid, size_t subid,
+                                   bool side, WriteBatch& batch) const;
+  util::geo::I32Box addPrecomputed(const PrecomputedLine& precomputed,
+                                   const std::string& gid, bool side,
+                                   WriteBatch& batch) const;
+  util::geo::I32Box addPrecomputed(const PrecomputedLine& precomputed,
+                                   const std::string& gid, size_t subid,
+                                   bool side, WriteBatch& batch) const;
 
   void flush();
 

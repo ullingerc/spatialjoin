@@ -76,6 +76,110 @@ std::string fullRun(const std::string& file, sj::SweeperCfg cfg,
 }
 
 // _____________________________________________________________________________
+// Checks that Sweeper::addPrecomputed(), fed a PrecomputedArea/PrecomputedLine
+// obtained from precomputeArea()/precomputeLine(), produces the same
+// WriteCand output (decoded GeometryCache content and BoxVal) as the
+// corresponding Sweeper::add() call. The raw serialized bytes themselves are
+// *not* compared byte-for-byte: XSortedTuple has trailing alignment padding
+// that is never initialized, so even two consecutive add() calls for the same
+// geometry produce differing raw bytes -- this is pre-existing and unrelated
+// to addPrecomputed().
+void testPrecomputedParity(sj::SweeperCfg cfg) {
+  // outer ring has >= 10 points and there is a hole, so this always takes the
+  // "general" (non-simple, non-folded) area representation
+  const std::string polyWkt =
+      "POLYGON((0 0, 10 0, 10 1, 9 1, 9 2, 8 2, 8 3, 7 3, 7 4, 6 4, 6 5, 5 5, "
+      "5 10, 0 10, 0 0),(2 2, 4 2, 4 4, 2 4, 2 2))";
+  auto poly = util::geo::polygonFromWKTProj<int32_t>(polyWkt,
+                                                      sj::WKTParser::projFunc);
+
+  // more than 2 points, so this always takes the "general" (non-simple) line
+  // representation
+  const std::string lineWkt = "LINESTRING(0 0, 1 1, 2 0, 3 1, 4 0)";
+  auto line = util::geo::lineFromWKTProj<int32_t>(lineWkt,
+                                                   sj::WKTParser::projFunc);
+
+  sj::Sweeper sweeper(cfg, ".");
+
+  // throwaway decoders, just used to turn WriteCand::raw back into a
+  // comparable value; StorageOptions must match what the Sweeper's own
+  // caches were constructed with above
+  sj::GeometryCache<sj::Area> areaDecoder({cfg.useOBB}, 1000, 1000, 1, ".");
+  sj::GeometryCache<sj::Line> lineDecoder({cfg.useOBB}, 1000, 1000, 1, ".");
+
+  for (bool side : {false, true}) {
+    {
+      sj::WriteBatch batchAdd, batchPre;
+      auto boxAdd = sweeper.add(poly, "somewhatlonggid", 0, side, batchAdd);
+      auto pre = sj::precomputeArea(poly, cfg);
+      auto boxPre =
+          sweeper.addPrecomputed(pre, "somewhatlonggid", 0, side, batchPre);
+
+      TEST(boxAdd == boxPre);
+      TEST(batchAdd.areas.size(), ==, (size_t)1);
+      TEST(batchPre.areas.size(), ==, (size_t)1);
+
+      const auto& a = batchAdd.areas[0];
+      const auto& b = batchPre.areas[0];
+
+      std::stringstream ssA(a.raw), ssB(b.raw);
+      auto decA = areaDecoder.getFrom(0, ssA).second;
+      auto decB = areaDecoder.getFrom(0, ssB).second;
+      TEST(decA.geom == decB.geom);
+      TEST(decA.id == decB.id);
+      TEST(decA.subId, ==, decB.subId);
+      TEST(decA.boxIds == decB.boxIds);
+      TEST(decA.obb == decB.obb);
+
+      TEST(a.gid == b.gid);
+      TEST(a.subid, ==, b.subid);
+      TEST(a.boxvalIn.loY, ==, b.boxvalIn.loY);
+      TEST(a.boxvalIn.upY, ==, b.boxvalIn.upY);
+      TEST(a.boxvalIn.val, ==, b.boxvalIn.val);
+      TEST(a.boxvalIn.type, ==, b.boxvalIn.type);
+      TEST(a.boxvalIn.areaOrLen, ==, b.boxvalIn.areaOrLen);
+      TEST(a.boxvalIn.numAnchors, ==, b.boxvalIn.numAnchors);
+      TEST(a.boxvalIn.side, ==, b.boxvalIn.side);
+      TEST(a.boxvalIn.large, ==, b.boxvalIn.large);
+      TEST(a.boxvalIn.size, ==, b.boxvalIn.size);
+      TEST(a.boxvalIn.b45 == b.boxvalIn.b45);
+      TEST(a.boxvalOut.val, ==, b.boxvalOut.val);
+      TEST(a.boxvalOut.point == b.boxvalOut.point);
+    }
+
+    {
+      sj::WriteBatch batchAdd, batchPre;
+      auto boxAdd = sweeper.add(line, "somewhatlonggid", 0, side, batchAdd);
+      auto pre = sj::precomputeLine(line, cfg);
+      auto boxPre =
+          sweeper.addPrecomputed(pre, "somewhatlonggid", 0, side, batchPre);
+
+      TEST(boxAdd == boxPre);
+      TEST(batchAdd.lines.size(), ==, (size_t)1);
+      TEST(batchPre.lines.size(), ==, (size_t)1);
+
+      const auto& a = batchAdd.lines[0];
+      const auto& b = batchPre.lines[0];
+
+      std::stringstream ssA(a.raw), ssB(b.raw);
+      auto decA = lineDecoder.getFrom(0, ssA).second;
+      auto decB = lineDecoder.getFrom(0, ssB).second;
+      TEST(decA.geom == decB.geom);
+      TEST(decA.id == decB.id);
+      TEST(decA.subId, ==, decB.subId);
+      TEST(decA.boxIds == decB.boxIds);
+      TEST(decA.obb == decB.obb);
+
+      TEST(a.gid == b.gid);
+      TEST(a.boxvalIn.areaOrLen, ==, b.boxvalIn.areaOrLen);
+      TEST(a.boxvalIn.numAnchors, ==, b.boxvalIn.numAnchors);
+      TEST(a.boxvalIn.b45 == b.boxvalIn.b45);
+      TEST(a.boxvalOut.point == b.boxvalOut.point);
+    }
+  }
+}
+
+// _____________________________________________________________________________
 int main(int, char**) {
   sj::SweeperCfg baseline{
       NUM_THREADS,
@@ -290,6 +394,10 @@ int main(int, char**) {
   std::vector<sj::SweeperCfg> cfgs{baseline,    all,         noSurfaceArea,
                                    noBoxIds,    noObb,       noDiagBox,
                                    noFastSweep};
+
+  for (auto cfg : cfgs) {
+    testPrecomputedParity(cfg);
+  }
 
   for (auto cfg : cfgs) {
     {

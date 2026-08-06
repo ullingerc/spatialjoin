@@ -27,6 +27,8 @@
 
 using sj::GeomCheckRes;
 using sj::GeomType;
+using sj::PrecomputedArea;
+using sj::PrecomputedLine;
 using sj::Sweeper;
 using sj::boxids::boxIdIsect;
 using sj::boxids::BoxIdList;
@@ -379,6 +381,139 @@ I32Box Sweeper::add(const I32Polygon& poly, const std::string& gidR,
 }
 
 // _____________________________________________________________________________
+PrecomputedArea sj::precomputeArea(const I32Polygon& poly,
+                                   const SweeperCfg& cfg) {
+  PrecomputedArea pre;
+
+  pre.spoly = I32XSortedPolygon(poly);
+
+  if (pre.spoly.empty()) return pre;
+
+  const auto& rawBox = pre.spoly.boundingBox();
+
+  pre.polySize = poly.size();
+  pre.areaSize = area(poly);
+
+  if (cfg.useBoxIds) {
+    double outerAreaSize = outerArea(poly);
+    pre.boxIds = packBoxIds(getBoxIds(pre.spoly, rawBox, outerAreaSize));
+  }
+
+  if (cfg.useDiagBox) {
+    auto polyR = util::geo::rotateSinCos(poly, sin45, cos45, I32Point(0, 0));
+    pre.rawBox45 = getBoundingBox(polyR);
+  }
+
+  if (!cfg.useFastSweepSkip) {
+    pre.spoly.setInnerMaxSegLen(std::numeric_limits<int32_t>::max());
+    pre.spoly.getOuter().setMaxSegLen(std::numeric_limits<int32_t>::max());
+    for (auto& inner : pre.spoly.getInners()) {
+      inner.setMaxSegLen(std::numeric_limits<int32_t>::max());
+    }
+  }
+
+  if (cfg.useOBB && poly.getOuter().size() >= OBB_MIN_SIZE) {
+    pre.obb = util::geo::convexHull(
+        util::geo::pad(util::geo::getOrientedEnvelope(poly), 10));
+
+    // drop redundant oriented bbox
+    if (pre.obb.getOuter().size() >= poly.getOuter().size()) pre.obb = {};
+  }
+
+  pre.rightPoint = pre.spoly.getOuter().rawRing().back().p;
+
+  return pre;
+}
+
+// _____________________________________________________________________________
+I32Box Sweeper::addPrecomputed(const PrecomputedArea& pre,
+                               const std::string& gidR, bool side,
+                               WriteBatch& batch) const {
+  return addPrecomputed(pre, gidR, 0, side, batch);
+}
+
+// _____________________________________________________________________________
+I32Box Sweeper::addPrecomputed(const PrecomputedArea& pre,
+                               const std::string& gidR, size_t subid,
+                               bool side, WriteBatch& batch) const {
+  if (subid == 0 && _cfg.de9imFilter != util::geo::FANY) {
+    // drop certain geometries if we can be sure that they will never match
+    // the given DE-9IM filter -- same checks as in add(I32Polygon...)
+    if (_cfg.de9imFilter.minBoundaryDim() > 1) return {};
+    if (_cfg.de9imFilter.maxInteriorDim() < 2) return {};
+    if (side && _cfg.de9imFilter.maxRightInteriorDim() < 2) return {};
+    if (side && _cfg.de9imFilter.minRightBoundaryDim() > 1) return {};
+    if (_numSides > 1 && !side &&
+        _cfg.de9imFilter.maxLeftInteriorDim() < 2)
+      return {};
+    if (_numSides > 1 && !side &&
+        _cfg.de9imFilter.minLeftBoundaryDim() > 1)
+      return {};
+  }
+
+  std::string gid = (side ? ("B" + gidR) : ("A" + gidR));
+
+  const auto& rawBox = pre.spoly.boundingBox();
+  const auto& box = getPaddedBoundingBox(rawBox);
+  if (!util::geo::intersects(box, _filterBox)) return {};
+
+  if (pre.spoly.empty()) return box;
+
+  I32Box box45;
+  if (_cfg.useDiagBox) box45 = getPaddedBoundingBox(pre.rawBox45, rawBox);
+
+  WriteCand cur;
+  cur.subid = subid;
+  cur.gid = gid;
+
+  std::stringstream str;
+  _areaCache.writeTo({pre.spoly, gid, subid, pre.boxIds, pre.obb}, str);
+  cur.raw = str.str();
+
+  size_t estimatedSize = pre.spoly.getOuter().rawRing().size() *
+                         sizeof(util::geo::XSortedTuple<int32_t>);
+  for (const auto& p : pre.spoly.getInners()) {
+    estimatedSize +=
+        p.rawRing().size() * sizeof(util::geo::XSortedTuple<int32_t>);
+  }
+
+  int32_t polySizeCapped =
+      pre.polySize < std::numeric_limits<int32_t>::max()
+          ? static_cast<int32_t>(pre.polySize)
+          : std::numeric_limits<int32_t>::max();
+
+  cur.boxvalIn = {0,  // placeholder, will be overwritten later on
+                  box.getLowerLeft().getY(),
+                  box.getUpperRight().getY(),
+                  box.getLowerLeft().getX(),
+                  false,
+                  POLYGON,
+                  pre.areaSize,
+                  {},
+                  pre.polySize,
+                  box45,
+                  side,
+                  estimatedSize > GEOM_LARGENESS_THRESHOLD,
+                  polySizeCapped};
+  cur.boxvalOut = {0,  // placeholder, will be overwritten later on
+                   box.getLowerLeft().getY(),
+                   box.getUpperRight().getY(),
+                   box.getUpperRight().getX(),
+                   true,
+                   POLYGON,
+                   pre.areaSize,
+                   pre.rightPoint,
+                   pre.polySize,
+                   box45,
+                   side,
+                   estimatedSize > GEOM_LARGENESS_THRESHOLD,
+                   polySizeCapped};
+  batch.areas.emplace_back(cur);
+
+  return box;
+}
+
+// _____________________________________________________________________________
 I32Box Sweeper::add(const I32Line& line, const std::string& gid, bool side,
                     WriteBatch& batch) const {
   return add(line, gid, 0, side, batch);
@@ -542,6 +677,137 @@ I32Box Sweeper::add(const I32Line& line, const std::string& gidR, size_t subid,
                      lineSizeCapped};
     batch.lines.emplace_back(cur);
   }
+
+  return box;
+}
+
+// _____________________________________________________________________________
+PrecomputedLine sj::precomputeLine(const I32Line& line,
+                                   const SweeperCfg& cfg) {
+  PrecomputedLine pre;
+
+  if (line.size() < 2) return pre;
+
+  pre.sline = I32XSortedLine(line);
+  pre.lineSize = line.size();
+  pre.len = util::geo::len(line);
+
+  const auto& rawBox = pre.sline.boundingBox();
+
+  if (cfg.useBoxIds) {
+    pre.boxIds = packBoxIds(getBoxIds(line, rawBox));
+  }
+
+  if (cfg.useDiagBox) {
+    auto lineR = util::geo::rotateSinCos(line, sin45, cos45, I32Point(0, 0));
+    pre.rawBox45 = getBoundingBox(lineR);
+  }
+
+  if (!cfg.useFastSweepSkip) {
+    pre.sline.setMaxSegLen(std::numeric_limits<int32_t>::max());
+  }
+
+  if (cfg.useOBB && line.size() >= OBB_MIN_SIZE) {
+    pre.obb = util::geo::convexHull(
+        util::geo::pad(util::geo::getOrientedEnvelope(line), 10));
+
+    // drop redundant oriented bbox
+    if (pre.obb.getOuter().size() >= line.size()) pre.obb = {};
+  }
+
+  if (pre.sline.rawLine().empty()) return pre;
+  pre.rightPoint = pre.sline.rawLine().back().p;
+
+  return pre;
+}
+
+// _____________________________________________________________________________
+I32Box Sweeper::addPrecomputed(const PrecomputedLine& pre,
+                               const std::string& gidR, bool side,
+                               WriteBatch& batch) const {
+  return addPrecomputed(pre, gidR, 0, side, batch);
+}
+
+// _____________________________________________________________________________
+I32Box Sweeper::addPrecomputed(const PrecomputedLine& pre,
+                               const std::string& gidR, size_t subid,
+                               bool side, WriteBatch& batch) const {
+  if (pre.lineSize < 2) return {};
+
+  if (subid == 0 && _cfg.de9imFilter != util::geo::FANY) {
+    // drop certain geometries if we can be sure that they will never match
+    // the given DE-9IM filter -- same checks as in add(I32Line...)
+    if (_cfg.de9imFilter.minInteriorDim() > 1) return {};
+    if (_cfg.de9imFilter.minBoundaryDim() > 0) return {};
+    if (_cfg.de9imFilter.maxInteriorDim() < 1) return {};
+    if (side && _cfg.de9imFilter.minRightInteriorDim() > 1) return {};
+    if (side && _cfg.de9imFilter.minRightBoundaryDim() > 0) return {};
+    if (side && _cfg.de9imFilter.maxRightInteriorDim() < 1) return {};
+    if (_numSides > 1 && !side &&
+        _cfg.de9imFilter.minLeftInteriorDim() > 1)
+      return {};
+    if (_numSides > 1 && !side &&
+        _cfg.de9imFilter.maxLeftInteriorDim() < 1)
+      return {};
+    if (_numSides > 1 && !side &&
+        _cfg.de9imFilter.minLeftBoundaryDim() > 0)
+      return {};
+  }
+  if (_cfg.de9imFilter.maxExteriorDim() < 2) return {};
+
+  std::string gid = (side ? ("B" + gidR) : ("A" + gidR));
+
+  const auto& rawBox = pre.sline.boundingBox();
+  const auto& box = getPaddedBoundingBox(rawBox);
+  if (!util::geo::intersects(box, _filterBox)) return {};
+  if (pre.sline.rawLine().empty()) return box;
+
+  I32Box box45;
+  if (_cfg.useDiagBox) box45 = getPaddedBoundingBox(pre.rawBox45, rawBox);
+
+  WriteCand cur;
+  cur.subid = subid;
+  cur.gid = gid;
+
+  std::stringstream str;
+  _lineCache.writeTo({pre.sline, gid, subid, pre.boxIds, pre.obb}, str);
+  cur.raw = str.str();
+
+  size_t estimatedSize =
+      pre.sline.rawLine().size() * sizeof(util::geo::XSortedTuple<int32_t>);
+
+  int32_t lineSizeCapped =
+      pre.lineSize < std::numeric_limits<int32_t>::max()
+          ? static_cast<int32_t>(pre.lineSize)
+          : std::numeric_limits<int32_t>::max();
+
+  cur.boxvalIn = {0,  // placeholder, will be overwritten later on
+                  box.getLowerLeft().getY(),
+                  box.getUpperRight().getY(),
+                  box.getLowerLeft().getX(),
+                  false,
+                  LINE,
+                  pre.len,
+                  {},
+                  pre.lineSize,
+                  box45,
+                  side,
+                  estimatedSize > GEOM_LARGENESS_THRESHOLD,
+                  lineSizeCapped};
+  cur.boxvalOut = {0,  // placeholder, will be overwritten later on
+                   box.getLowerLeft().getY(),
+                   box.getUpperRight().getY(),
+                   box.getUpperRight().getX(),
+                   true,
+                   LINE,
+                   pre.len,
+                   pre.rightPoint,
+                   pre.lineSize,
+                   box45,
+                   side,
+                   estimatedSize > GEOM_LARGENESS_THRESHOLD,
+                   lineSizeCapped};
+  batch.lines.emplace_back(cur);
 
   return box;
 }
