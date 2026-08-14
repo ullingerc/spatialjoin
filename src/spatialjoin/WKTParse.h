@@ -113,8 +113,6 @@ class WKTParserBase {
  protected:
   void parseLine(const char *c, size_t len, size_t gid, size_t t,
                  sj::WriteBatch &batch, bool side, bool useIdEnhance) {
-    using namespace util::geo;
-
     const char *lastC = c + len;
 
     // search for first occurance of tab
@@ -139,6 +137,23 @@ class WKTParserBase {
       side = atoi(c);
       c = idp + 1;
     }
+
+    parseGeom(c, lastC, id, t, batch, side);
+  }
+
+  // Same as above, but the caller already has the geometry id in the exact
+  // form it wants passed to `Sweeper::add` (for example a compact binary
+  // encoding of a numeric row id), so neither the tab-based id lookup nor the
+  // `gid`-to-decimal-string conversion above is needed or performed.
+  void parseLine(const char *c, size_t len, const std::string &id, size_t t,
+                 sj::WriteBatch &batch, bool side) {
+    parseGeom(c, c + len, id, t, batch, side);
+  }
+
+ private:
+  void parseGeom(const char *c, const char *lastC, const std::string &id,
+                 size_t t, sj::WriteBatch &batch, bool side) {
+    using namespace util::geo;
 
     auto crsType = getCRSType(c, &c);
 
@@ -251,6 +266,8 @@ class WKTParserBase {
       }
     }
   };
+
+ protected:
   virtual void processQueue(size_t t) = 0;
   size_t _gid = 1;
   std::string _dangling;
